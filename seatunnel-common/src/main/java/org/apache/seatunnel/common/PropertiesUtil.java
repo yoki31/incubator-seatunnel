@@ -19,21 +19,70 @@ package org.apache.seatunnel.common;
 
 import org.apache.seatunnel.shade.com.typesafe.config.Config;
 
+import org.apache.commons.lang3.StringUtils;
+
 import java.util.Properties;
+import java.util.function.Consumer;
+import java.util.function.Function;
 
-public class PropertiesUtil {
+public final class PropertiesUtil {
 
-    public static void setProperties(Config config, Properties properties, String prefix, boolean keepPrefix) {
-        config.entrySet().forEach(entry -> {
-            String key = entry.getKey();
-            Object value = entry.getValue().unwrapped();
-            if (key.startsWith(prefix)) {
-                if (keepPrefix) {
-                    properties.put(key, value);
-                } else {
-                    properties.put(key.substring(prefix.length()), value);
-                }
-            }
-        });
+    private PropertiesUtil() {}
+
+    public static void setProperties(
+            Config config, Properties properties, String prefix, boolean keepPrefix) {
+        config.entrySet()
+                .forEach(
+                        entry -> {
+                            String key = entry.getKey();
+                            Object value = entry.getValue().unwrapped();
+                            if (key.startsWith(prefix)) {
+                                if (keepPrefix) {
+                                    properties.put(key, value);
+                                } else {
+                                    properties.put(key.substring(prefix.length()), value);
+                                }
+                            }
+                        });
+    }
+
+    public static <E extends Enum<E>> E getEnum(
+            final Config conf, final String key, final Class<E> enumClass, final E defaultEnum) {
+        if (!conf.hasPath(key)) {
+            return defaultEnum;
+        }
+        final String value = conf.getString(key);
+        if (StringUtils.isBlank(value)) {
+            return defaultEnum;
+        }
+        return Enum.valueOf(enumClass, value.toUpperCase());
+    }
+
+    public static <T> void setOption(
+            Config config,
+            String optionName,
+            T defaultValue,
+            Function<String, T> getter,
+            Consumer<T> setter) {
+        T value;
+        if (config.hasPath(optionName)) {
+            value = getter.apply(optionName);
+        } else {
+            value = defaultValue;
+        }
+        if (value != null) {
+            setter.accept(value);
+        }
+    }
+
+    public static <T> void setOption(
+            Config config, String optionName, Function<String, T> getter, Consumer<T> setter) {
+        T value = null;
+        if (config.hasPath(optionName)) {
+            value = getter.apply(optionName);
+        }
+        if (value != null) {
+            setter.accept(value);
+        }
     }
 }

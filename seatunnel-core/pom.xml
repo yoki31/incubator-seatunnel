@@ -17,23 +17,49 @@
     limitations under the License.
 
 -->
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
     <parent>
         <groupId>org.apache.seatunnel</groupId>
         <artifactId>seatunnel</artifactId>
-        <version>2.0.5-SNAPSHOT</version>
+        <version>${revision}</version>
     </parent>
-    <modelVersion>4.0.0</modelVersion>
 
     <artifactId>seatunnel-core</artifactId>
     <packaging>pom</packaging>
+    <name>SeaTunnel : Core :</name>
 
     <modules>
-        <module>seatunnel-core-base</module>
-        <module>seatunnel-core-flink</module>
-        <module>seatunnel-core-spark</module>
-        <module>seatunnel-core-sql</module>
+        <module>seatunnel-core-starter</module>
+        <module>seatunnel-flink-starter</module>
+        <module>seatunnel-spark-starter</module>
+        <module>seatunnel-starter</module>
     </modules>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-dependency-plugin</artifactId>
+                    <executions>
+                        <execution>
+                            <id>copy-starter-logging-package-for-e2e</id>
+                            <goals>
+                                <goal>copy-dependencies</goal>
+                            </goals>
+                            <phase>package</phase>
+                            <configuration>
+                                <excludeTransitive>false</excludeTransitive>
+                                <includeGroupIds>org.slf4j,org.apache.logging.log4j</includeGroupIds>
+                                <includeArtifactIds>slf4j-api,jcl-over-slf4j,log4j-slf4j-impl,log4j-api,log4j-core</includeArtifactIds>
+                                <outputDirectory>${project.build.directory}/logging-e2e</outputDirectory>
+                            </configuration>
+                        </execution>
+                    </executions>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
 </project>
