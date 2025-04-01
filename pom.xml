@@ -94,7 +94,7 @@
         <phoenix-spark.version>5.0.0-HBase-2.0</phoenix-spark.version>
         <zkclient.version>0.3</zkclient.version>
         <flink-shaded-hadoop-2.version>2.7.5-7.0</flink-shaded-hadoop-2.version>
-        <parquet-avro.version>1.10.0</parquet-avro.version>
+        <parquet-avro.version>1.15.1</parquet-avro.version>
         <transport.version>6.3.1</transport.version>
         <elasticsearch-spark.version>6.8.3</elasticsearch-spark.version>
         <clickhouse-jdbc.version>0.2</clickhouse-jdbc.version>
