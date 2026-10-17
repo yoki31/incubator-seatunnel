@@ -17,55 +17,67 @@
 name: publish-docker
 
 on:
+  workflow_dispatch:
   push:
-    branches:
-      - dev
-      - docker
+    tags:
+      - '*'
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
 
 env:
-  HUB: ghcr.io/${{ github.repository }}
+  DOCKER_USERNAME: ${{ secrets.DOCKERHUB_USER }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
 
 jobs:
   build:
-    if: github.repository == 'apache/incubator-seatunnel'
+    if: github.repository == 'apache/seatunnel' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: free disk space
+        run: tools/github/free_disk_space.sh
+      - uses: actions/checkout@v4
       - name: Cache local Maven repository
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         with:
           path: ~/.m2/repository
           key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
             ${{ runner.os }}-maven-
-      - name: Set up JDK 1.8
-        uses: actions/setup-java@v2
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          java-version:  8
-          distribution: 'adopt'
+          java-version: '17'
+          distribution: 'temurin'
+
       - name: Log in to the Container registry
-        uses: docker/login-action@v1.10.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ${{ env.HUB }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Build and push docker images
         env:
-          MAVEN_OPTS: -Xmx2G -Xms2G
+          MAVEN_OPTS: -Xmx4096m
         run: |
-          ./mvnw -B clean deploy \
-          -Dmaven.test.skip \
-          -Dmaven.javadoc.skip \
-          -Dmaven.checkstyle.skip \
+          ./mvnw -B clean install \
+          -Dmaven.test.skip=true \
+          -Dmaven.javadoc.skip=true \
+          -Dlicense.skipAddThirdParty=true \
+          -D"docker.build.skip"=false \
+          -D"docker.verify.skip"=false \
+          -D"docker.push.skip"=false \
+          -D"skip.spotless"=true \
           -Dmaven.deploy.skip \
-          -Ddocker.tag=${{ github.sha }} \
-          -Ddocker.hub=${{ env.HUB }} \
-          -Pdocker
+          --no-snapshot-updates \
+          -Pdocker,seatunnel

@@ -1,0 +1,226 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.seatunnel.connectors.seatunnel.cdc.mysql.source;
+
+import org.apache.seatunnel.api.configuration.ReadonlyConfig;
+import org.apache.seatunnel.api.configuration.util.Conditions;
+import org.apache.seatunnel.api.configuration.util.OptionRule;
+import org.apache.seatunnel.api.source.SeaTunnelSource;
+import org.apache.seatunnel.api.source.SourceSplit;
+import org.apache.seatunnel.api.table.catalog.CatalogTable;
+import org.apache.seatunnel.api.table.catalog.CatalogTableUtil;
+import org.apache.seatunnel.api.table.catalog.TablePath;
+import org.apache.seatunnel.api.table.connector.TableSource;
+import org.apache.seatunnel.api.table.factory.Factory;
+import org.apache.seatunnel.api.table.factory.TableSourceFactoryContext;
+import org.apache.seatunnel.connectors.cdc.base.config.JdbcSourceTableConfig;
+import org.apache.seatunnel.connectors.cdc.base.option.JdbcSourceOptions;
+import org.apache.seatunnel.connectors.cdc.base.option.SourceOptions;
+import org.apache.seatunnel.connectors.cdc.base.option.StartupMode;
+import org.apache.seatunnel.connectors.cdc.base.option.StopMode;
+import org.apache.seatunnel.connectors.cdc.base.source.BaseChangeStreamTableSourceFactory;
+import org.apache.seatunnel.connectors.cdc.base.utils.CatalogTableUtils;
+import org.apache.seatunnel.connectors.seatunnel.cdc.mysql.config.MySqlIncrementalSourceOptions;
+import org.apache.seatunnel.connectors.seatunnel.cdc.mysql.config.MySqlSourceConfigFactory;
+import org.apache.seatunnel.connectors.seatunnel.cdc.mysql.config.MySqlSpecificOffsetGuards;
+
+import com.google.auto.service.AutoService;
+import lombok.extern.slf4j.Slf4j;
+
+import java.io.Serializable;
+import java.util.List;
+import java.util.Optional;
+
+@AutoService(Factory.class)
+@Slf4j
+public class MySqlIncrementalSourceFactory extends BaseChangeStreamTableSourceFactory {
+    @Override
+    public String factoryIdentifier() {
+        return MySqlIncrementalSource.IDENTIFIER;
+    }
+
+    @Override
+    public OptionRule optionRule() {
+        return getOptionRuleBuilder().build();
+    }
+
+    /**
+     * Create the common MySQL CDC source option rule builder.
+     *
+     * <p>Subclasses that reuse the MySQL CDC runtime can add connector-specific options before
+     * building the rule.
+     */
+    protected OptionRule.Builder getOptionRuleBuilder() {
+        return JdbcSourceOptions.getBaseRule()
+                .required(
+                        MySqlIncrementalSourceOptions.USERNAME,
+                        MySqlIncrementalSourceOptions.PASSWORD,
+                        MySqlIncrementalSourceOptions.URL)
+                .exclusive(
+                        MySqlIncrementalSourceOptions.TABLE_NAMES,
+                        MySqlIncrementalSourceOptions.TABLE_PATTERN)
+                .optional(
+                        MySqlIncrementalSourceOptions.DATABASE_NAMES,
+                        MySqlIncrementalSourceOptions.SERVER_ID,
+                        MySqlIncrementalSourceOptions.SERVER_TIME_ZONE,
+                        MySqlIncrementalSourceOptions.CONNECT_TIMEOUT_MS,
+                        MySqlIncrementalSourceOptions.CONNECT_MAX_RETRIES,
+                        MySqlIncrementalSourceOptions.CONNECTION_POOL_SIZE,
+                        MySqlIncrementalSourceOptions
+                                .CHUNK_KEY_EVEN_DISTRIBUTION_FACTOR_LOWER_BOUND,
+                        MySqlIncrementalSourceOptions
+                                .CHUNK_KEY_EVEN_DISTRIBUTION_FACTOR_UPPER_BOUND,
+                        MySqlIncrementalSourceOptions.SAMPLE_SHARDING_THRESHOLD,
+                        MySqlIncrementalSourceOptions.INVERSE_SAMPLING_RATE,
+                        MySqlIncrementalSourceOptions.SPLIT_ALLOW_SAMPLING,
+                        MySqlIncrementalSourceOptions.TABLE_NAMES_CONFIG,
+                        MySqlIncrementalSourceOptions.SCHEMA_CHANGES_ENABLED,
+                        MySqlIncrementalSourceOptions.SCHEMA_CHANGES_INCLUDE,
+                        MySqlIncrementalSourceOptions.SCHEMA_CHANGES_EXCLUDE,
+                        MySqlIncrementalSourceOptions.INT_TYPE_NARROWING)
+                .optional(
+                        MySqlIncrementalSourceOptions.STARTUP_MODE,
+                        Conditions.extension(
+                                MySqlIncrementalSourceOptions.STARTUP_MODE,
+                                MySqlSpecificOffsetGuards.specificStartupModeGuard(
+                                        MySqlIncrementalSourceOptions.STARTUP_MODE,
+                                        SourceOptions.STARTUP_SPECIFIC_OFFSET_FILE,
+                                        SourceOptions.STARTUP_SPECIFIC_OFFSET_POS)))
+                .optional(MySqlIncrementalSourceOptions.STOP_MODE)
+                .conditional(
+                        MySqlIncrementalSourceOptions.STARTUP_MODE,
+                        StartupMode.INITIAL,
+                        SourceOptions.EXACTLY_ONCE)
+                .conditional(
+                        MySqlIncrementalSourceOptions.STOP_MODE,
+                        StopMode.SPECIFIC,
+                        SourceOptions.STOP_SPECIFIC_OFFSET_FILE,
+                        SourceOptions.STOP_SPECIFIC_OFFSET_POS)
+                .conditional(
+                        MySqlIncrementalSourceOptions.STARTUP_MODE,
+                        StartupMode.TIMESTAMP,
+                        SourceOptions.STARTUP_TIMESTAMP)
+                .optional(
+                        SourceOptions.STARTUP_SPECIFIC_OFFSET_FILE,
+                        Conditions.extension(
+                                SourceOptions.STARTUP_SPECIFIC_OFFSET_FILE,
+                                MySqlSpecificOffsetGuards.specificOffsetFileGuard(
+                                        MySqlIncrementalSourceOptions.STARTUP_MODE,
+                                        SourceOptions.STARTUP_SPECIFIC_OFFSET_FILE,
+                                        SourceOptions.STARTUP_SPECIFIC_OFFSET_POS)))
+                .optional(
+                        SourceOptions.STARTUP_SPECIFIC_OFFSET_POS,
+                        Conditions.extension(
+                                SourceOptions.STARTUP_SPECIFIC_OFFSET_POS,
+                                MySqlSpecificOffsetGuards.specificOffsetPosGuard(
+                                        MySqlIncrementalSourceOptions.STARTUP_MODE,
+                                        SourceOptions.STARTUP_SPECIFIC_OFFSET_POS,
+                                        SourceOptions.STARTUP_SPECIFIC_OFFSET_FILE)))
+                .optional(
+                        MySqlIncrementalSourceOptions.STARTUP_SPECIFIC_OFFSET_GTID_SET,
+                        Conditions.extension(
+                                MySqlIncrementalSourceOptions.STARTUP_SPECIFIC_OFFSET_GTID_SET,
+                                MySqlSpecificOffsetGuards.specificOffsetGtidSetGuard(
+                                        MySqlIncrementalSourceOptions.STARTUP_MODE,
+                                        MySqlIncrementalSourceOptions
+                                                .STARTUP_SPECIFIC_OFFSET_GTID_SET)))
+                .optional(
+                        MySqlIncrementalSourceOptions.STARTUP_SPECIFIC_OFFSET_SKIP_EVENTS,
+                        Conditions.extension(
+                                MySqlIncrementalSourceOptions.STARTUP_SPECIFIC_OFFSET_SKIP_EVENTS,
+                                MySqlSpecificOffsetGuards.specificOffsetSkipGuard(
+                                        MySqlIncrementalSourceOptions.STARTUP_MODE,
+                                        MySqlIncrementalSourceOptions
+                                                .STARTUP_SPECIFIC_OFFSET_SKIP_EVENTS)))
+                .optional(
+                        MySqlIncrementalSourceOptions.STARTUP_SPECIFIC_OFFSET_SKIP_ROWS,
+                        Conditions.extension(
+                                MySqlIncrementalSourceOptions.STARTUP_SPECIFIC_OFFSET_SKIP_ROWS,
+                                MySqlSpecificOffsetGuards.specificOffsetSkipGuard(
+                                        MySqlIncrementalSourceOptions.STARTUP_MODE,
+                                        MySqlIncrementalSourceOptions
+                                                .STARTUP_SPECIFIC_OFFSET_SKIP_ROWS)));
+    }
+
+    @Override
+    public Class<? extends SeaTunnelSource> getSourceClass() {
+        return MySqlIncrementalSource.class;
+    }
+
+    @Override
+    public <T, SplitT extends SourceSplit, StateT extends Serializable>
+            TableSource<T, SplitT, StateT> restoreSource(
+                    TableSourceFactoryContext context, List<CatalogTable> restoreTables) {
+        return () -> {
+            ReadonlyConfig config = context.getOptions();
+            return (SeaTunnelSource<T, SplitT, StateT>)
+                    new MySqlIncrementalSource<>(
+                            config, buildCatalogTables(context, config, restoreTables));
+        };
+    }
+
+    /**
+     * Build source tables from the current configuration and checkpoint state.
+     *
+     * <p>Subclasses that reuse the MySQL CDC runtime can provide a normalized connector
+     * configuration while keeping catalog discovery and checkpoint merge behavior aligned.
+     */
+    protected List<CatalogTable> buildCatalogTables(
+            TableSourceFactoryContext context,
+            ReadonlyConfig config,
+            List<CatalogTable> restoreTables) {
+        // Load the JDBC driver in to DriverManager
+        try {
+            Class.forName("com.mysql.cj.jdbc.Driver");
+        } catch (Exception e) {
+            log.warn("Failed to load JDBC driver com.mysql.cj.jdbc.Driver ", e);
+        }
+        List<CatalogTable> catalogTables =
+                CatalogTableUtil.getCatalogTables(config, context.getClassLoader());
+        boolean enableSchemaChange =
+                config.getOptional(SourceOptions.SCHEMA_CHANGES_ENABLED)
+                        .orElse(
+                                // TODO remove this after all users used the new schema change
+                                // option
+                                config.getOptional(SourceOptions.DEBEZIUM_PROPERTIES)
+                                        .map(
+                                                e ->
+                                                        e.getOrDefault(
+                                                                MySqlSourceConfigFactory
+                                                                        .SCHEMA_CHANGE_KEY,
+                                                                SourceOptions.SCHEMA_CHANGES_ENABLED
+                                                                        .defaultValue()
+                                                                        .toString()))
+                                        .map(Boolean::parseBoolean)
+                                        .orElse(
+                                                SourceOptions.SCHEMA_CHANGES_ENABLED
+                                                        .defaultValue()));
+        if (!restoreTables.isEmpty() && enableSchemaChange) {
+            catalogTables = mergeTableStruct(catalogTables, restoreTables);
+        }
+
+        Optional<List<JdbcSourceTableConfig>> tableConfigs =
+                config.getOptional(JdbcSourceOptions.TABLE_NAMES_CONFIG);
+        if (tableConfigs.isPresent()) {
+            catalogTables =
+                    CatalogTableUtils.mergeCatalogTableConfig(
+                            catalogTables, tableConfigs.get(), text -> TablePath.of(text, false));
+        }
+        return catalogTables;
+    }
+}

@@ -1,0 +1,370 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.seatunnel.connectors.doris.source.reader;
+
+import org.apache.seatunnel.shade.com.google.common.annotations.VisibleForTesting;
+
+import org.apache.seatunnel.api.table.catalog.CatalogTable;
+import org.apache.seatunnel.api.table.catalog.Column;
+import org.apache.seatunnel.api.table.type.SeaTunnelRow;
+import org.apache.seatunnel.api.table.type.SeaTunnelRowType;
+import org.apache.seatunnel.connectors.doris.backend.BackendClient;
+import org.apache.seatunnel.connectors.doris.config.DorisSourceConfig;
+import org.apache.seatunnel.connectors.doris.config.DorisSourceOptions;
+import org.apache.seatunnel.connectors.doris.exception.DorisConnectorErrorCode;
+import org.apache.seatunnel.connectors.doris.exception.DorisConnectorException;
+import org.apache.seatunnel.connectors.doris.rest.PartitionDefinition;
+import org.apache.seatunnel.connectors.doris.rest.models.Schema;
+import org.apache.seatunnel.connectors.doris.source.DorisSourceTable;
+import org.apache.seatunnel.connectors.doris.source.serialization.Routing;
+import org.apache.seatunnel.connectors.doris.util.SchemaUtils;
+import org.apache.seatunnel.connectors.seatunnel.common.source.arrow.reader.ArrowToSeatunnelRowReader;
+
+import org.apache.doris.sdk.thrift.TScanBatchResult;
+import org.apache.doris.sdk.thrift.TScanCloseParams;
+import org.apache.doris.sdk.thrift.TScanNextBatchParams;
+import org.apache.doris.sdk.thrift.TScanOpenParams;
+import org.apache.doris.sdk.thrift.TScanOpenResult;
+
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+import static org.apache.seatunnel.connectors.doris.datatype.AbstractDorisTypeConverter.DORIS_IPV4;
+import static org.apache.seatunnel.connectors.doris.util.ErrorMessages.SHOULD_NOT_HAPPEN_MESSAGE;
+
+@Slf4j
+public class DorisValueReader {
+
+    protected BackendClient client;
+    protected Lock clientLock = new ReentrantLock();
+
+    private PartitionDefinition partition;
+    private DorisSourceTable dorisSourceTable;
+    private DorisSourceConfig config;
+
+    protected int offset = 0;
+    protected AtomicBoolean eos = new AtomicBoolean(false);
+    protected ArrowToSeatunnelRowReader rowBatch;
+
+    // flag indicate if support deserialize Arrow to RowBatch asynchronously
+    protected boolean deserializeArrowToRowBatchAsync;
+
+    protected BlockingQueue<ArrowToSeatunnelRowReader> rowBatchBlockingQueue;
+    private TScanOpenParams openParams;
+    protected String contextId;
+    protected Schema schema;
+
+    protected SeaTunnelRowType seaTunnelRowType;
+    // Doris BE sends IPV4 through Arrow as a 32-bit integer, while the column is a STRING
+    private final int[] ipv4FieldIndexes;
+    protected boolean asyncThreadStarted;
+
+    public DorisValueReader(
+            PartitionDefinition partition,
+            DorisSourceConfig config,
+            DorisSourceTable dorisSourceTable) {
+        this.partition = partition;
+        this.config = config;
+        this.dorisSourceTable = dorisSourceTable;
+        this.client = backendClient();
+        this.deserializeArrowToRowBatchAsync = config.getDeserializeArrowAsync();
+        this.seaTunnelRowType = dorisSourceTable.getCatalogTable().getSeaTunnelRowType();
+        this.ipv4FieldIndexes =
+                ipv4FieldIndexes(dorisSourceTable.getCatalogTable(), seaTunnelRowType);
+        int blockingQueueSize = config.getDeserializeQueueSize();
+        if (this.deserializeArrowToRowBatchAsync) {
+            this.rowBatchBlockingQueue = new ArrayBlockingQueue<>(blockingQueueSize);
+        }
+        init();
+    }
+
+    private void init() {
+        clientLock.lock();
+        try {
+            this.openParams = openParams();
+            TScanOpenResult openResult = this.client.openScanner(this.openParams);
+            this.contextId = openResult.getContextId();
+            this.schema = SchemaUtils.convertToSchema(openResult.getSelectedColumns());
+        } finally {
+            clientLock.unlock();
+        }
+        this.asyncThreadStarted = asyncThreadStarted();
+        log.debug("Open scan result is, contextId: {}, schema: {}.", contextId, schema);
+    }
+
+    private BackendClient backendClient() {
+        try {
+            return new BackendClient(new Routing(partition.getBeAddress()), config);
+        } catch (IllegalArgumentException e) {
+            log.error("init backend:{} client failed,", partition.getBeAddress(), e);
+            throw new DorisConnectorException(DorisConnectorErrorCode.BACKEND_CLIENT_FAILED, e);
+        }
+    }
+
+    private TScanOpenParams openParams() {
+        TScanOpenParams params = new TScanOpenParams();
+        params.setCluster(DorisSourceOptions.DORIS_DEFAULT_CLUSTER);
+        params.setDatabase(partition.getDatabase());
+        params.setTable(partition.getTable());
+
+        params.setTabletIds(Arrays.asList(partition.getTabletIds().toArray(new Long[] {})));
+        params.setOpaquedQueryPlan(partition.getQueryPlan());
+        // max row number of one read batch
+        Integer batchSize = dorisSourceTable.getBatchSize();
+        Integer queryDorisTimeout = config.getRequestQueryTimeoutS();
+        Long execMemLimit = dorisSourceTable.getExecMemLimit();
+        params.setBatchSize(batchSize);
+        params.setQueryTimeout(queryDorisTimeout);
+        params.setMemLimit(execMemLimit);
+        params.setUser(config.getUsername());
+        params.setPasswd(config.getPassword());
+        log.debug(
+                "Open scan params is,cluster:{},database:{},table:{},tabletId:{},batch size:{},query timeout:{},execution memory limit:{},user:{},query plan: {}",
+                params.getCluster(),
+                params.getDatabase(),
+                params.getTable(),
+                params.getTabletIds(),
+                params.getBatchSize(),
+                params.getQueryTimeout(),
+                params.getMemLimit(),
+                params.getUser(),
+                params.getOpaquedQueryPlan());
+        return params;
+    }
+
+    /**
+     * Failure of {@link #asyncThread}, if any. The fetch thread cannot throw to the reader, so it
+     * records the failure here and {@link #hasNext()} reports it instead of returning an end of
+     * stream.
+     */
+    protected volatile Throwable asyncFailure;
+
+    protected Thread asyncThread = new Thread(this::asyncFetchBatches);
+
+    /**
+     * Fetches row batches from the backend until the scan is exhausted. Runs on {@link
+     * #asyncThread}.
+     *
+     * <p>{@code eos} is set even when the fetch fails: the consumer waits for either a batch or
+     * {@code eos}, so a fetch thread that died while {@code eos} was still false would leave {@link
+     * #hasNext()} polling forever instead of failing the job.
+     */
+    private void asyncFetchBatches() {
+        clientLock.lock();
+        try {
+            TScanNextBatchParams nextBatchParams = new TScanNextBatchParams();
+            nextBatchParams.setContextId(contextId);
+            while (!eos.get()) {
+                nextBatchParams.setOffset(offset);
+                TScanBatchResult nextResult = client.getNext(nextBatchParams);
+                eos.set(nextResult.isEos());
+                if (!eos.get()) {
+                    ArrowToSeatunnelRowReader rowBatch =
+                            new ArrowToSeatunnelRowReader(nextResult.getRows(), seaTunnelRowType)
+                                    .readArrow();
+                    offset += rowBatch.getReadRowCount();
+                    rowBatch.close();
+                    rowBatchBlockingQueue.put(rowBatch);
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            asyncFailure =
+                    new DorisConnectorException(DorisConnectorErrorCode.ROW_BATCH_GET_FAILED, e);
+        } catch (Throwable t) {
+            asyncFailure = t;
+        } finally {
+            eos.set(true);
+            clientLock.unlock();
+        }
+    }
+
+    protected boolean asyncThreadStarted() {
+        boolean started = false;
+        if (deserializeArrowToRowBatchAsync) {
+            asyncThread.start();
+            started = true;
+        }
+        return started;
+    }
+
+    /**
+     * read data and cached in rowBatch.
+     *
+     * @return true if hax next value
+     */
+    public boolean hasNext() {
+        boolean hasNext = false;
+        if (deserializeArrowToRowBatchAsync && asyncThreadStarted) {
+            // support deserialize Arrow to RowBatch asynchronously
+            if (rowBatch == null || !rowBatch.hasNext()) {
+                while (!eos.get() || !rowBatchBlockingQueue.isEmpty()) {
+                    if (!rowBatchBlockingQueue.isEmpty()) {
+                        try {
+                            rowBatch = rowBatchBlockingQueue.take();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new DorisConnectorException(
+                                    DorisConnectorErrorCode.ROW_BATCH_GET_FAILED, e);
+                        }
+                        hasNext = true;
+                        break;
+                    } else {
+                        // wait for rowBatch put in queue or eos change
+                        try {
+                            Thread.sleep(5);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new DorisConnectorException(
+                                    DorisConnectorErrorCode.ROW_BATCH_GET_FAILED, e);
+                        }
+                    }
+                }
+                // The queue is drained and the fetch thread has finished. If it finished with a
+                // failure, report it instead of reporting that the scan reached its end.
+                if (asyncFailure != null) {
+                    throw asyncFailure instanceof DorisConnectorException
+                            ? (DorisConnectorException) asyncFailure
+                            : new DorisConnectorException(
+                                    DorisConnectorErrorCode.ROW_BATCH_GET_FAILED, asyncFailure);
+                }
+            } else {
+                hasNext = true;
+            }
+        } else {
+            clientLock.lock();
+            try {
+                // Arrow data was acquired synchronously during the iterative process
+                if (!eos.get() && (rowBatch == null || !rowBatch.hasNext())) {
+                    if (rowBatch != null) {
+                        offset += rowBatch.getReadRowCount();
+                        rowBatch.close();
+                    }
+                    TScanNextBatchParams nextBatchParams = new TScanNextBatchParams();
+                    nextBatchParams.setContextId(contextId);
+                    nextBatchParams.setOffset(offset);
+                    TScanBatchResult nextResult = client.getNext(nextBatchParams);
+                    eos.set(nextResult.isEos());
+                    if (!eos.get()) {
+                        rowBatch =
+                                new ArrowToSeatunnelRowReader(
+                                                nextResult.getRows(), seaTunnelRowType)
+                                        .readArrow();
+                    }
+                }
+                hasNext = !eos.get();
+            } finally {
+                clientLock.unlock();
+            }
+        }
+        return hasNext;
+    }
+
+    /**
+     * get next value.
+     *
+     * @return next value
+     */
+    public SeaTunnelRow next() {
+        if (!hasNext()) {
+            log.error(SHOULD_NOT_HAPPEN_MESSAGE);
+            throw new DorisConnectorException(
+                    DorisConnectorErrorCode.SHOULD_NEVER_HAPPEN, "never happen error.");
+        }
+        SeaTunnelRow next = rowBatch.next();
+        convertIpv4Fields(next, ipv4FieldIndexes);
+        next.setTableId(dorisSourceTable.getTablePath().toString());
+        return next;
+    }
+
+    /**
+     * Finds the IPV4 fields by their catalog source type, because the row type only says STRING and
+     * the Arrow reader cannot tell an IPV4 column from a plain integer.
+     */
+    @VisibleForTesting
+    static int[] ipv4FieldIndexes(CatalogTable catalogTable, SeaTunnelRowType rowType) {
+        Map<String, String> sourceTypes = new HashMap<>();
+        for (Column column : catalogTable.getTableSchema().getColumns()) {
+            sourceTypes.put(column.getName(), column.getSourceType());
+        }
+        List<Integer> indexes = new ArrayList<>();
+        String[] fieldNames = rowType.getFieldNames();
+        for (int i = 0; i < fieldNames.length; i++) {
+            if (DORIS_IPV4.equalsIgnoreCase(sourceTypes.get(fieldNames[i]))) {
+                indexes.add(i);
+            }
+        }
+        return indexes.stream().mapToInt(Integer::intValue).toArray();
+    }
+
+    /**
+     * Runs after the Arrow-to-row step and turns the integer that Doris sends for IPV4 into
+     * dotted-decimal text, leaving NULL as is.
+     */
+    @VisibleForTesting
+    static void convertIpv4Fields(SeaTunnelRow row, int[] ipv4FieldIndexes) {
+        for (int index : ipv4FieldIndexes) {
+            Object value = row.getField(index);
+            if (value instanceof Number) {
+                row.setField(index, ipv4ToString(((Number) value).longValue()));
+            }
+        }
+    }
+
+    @VisibleForTesting
+    static String ipv4ToString(long value) {
+        return ((value >>> 24) & 0xFF)
+                + "."
+                + ((value >>> 16) & 0xFF)
+                + "."
+                + ((value >>> 8) & 0xFF)
+                + "."
+                + (value & 0xFF);
+    }
+
+    public void close() {
+        // Stop the asynchronous fetch before taking the client lock: the fetch thread holds that
+        // lock for the whole scan, so a reader that is still waiting for its first batch would
+        // otherwise block close() until the scan finishes on its own.
+        eos.set(true);
+        if (asyncThreadStarted) {
+            asyncThread.interrupt();
+        }
+        clientLock.lock();
+        try {
+            TScanCloseParams closeParams = new TScanCloseParams();
+            closeParams.setContextId(contextId);
+            client.closeScanner(closeParams);
+        } catch (Exception e) {
+            log.error("Failed to close reader with context id {}", contextId, e);
+            throw new DorisConnectorException(DorisConnectorErrorCode.RESOURCE_CLOSE_FAILED, e);
+        } finally {
+            clientLock.unlock();
+        }
+    }
+}
